@@ -1,4 +1,6 @@
 import logging
+from logging.handlers import RotatingFileHandler
+import requests
 from time import sleep
 from transitions import Machine
 from transitions.extensions.states import add_state_features, Timeout
@@ -9,11 +11,24 @@ from raspberrypi_utils.input_devices import VibrationSensor
 from raspberrypi_utils.output_devices import LED
 from raspberrypi_utils.utils import ReadConfigMixin, send_gmail
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s  (%(module)s) - %(message)s', level=logging.ERROR)
-logging.getLogger('transitions').setLevel(logging.INFO)
-logging.getLogger('raspberrypi_utils').setLevel(logging.ERROR)
-logging.getLogger(__name__).setLevel(logging.DEBUG)
-log = logging.getLogger()
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+log_filehandler = RotatingFileHandler('/var/log/laundryalarm/laundryalarm.log', maxBytes=1024**2, backupCount=100)
+log_filehandler.setFormatter(log_formatter)
+log_filehandler.setLevel(logging.INFO)
+
+log_consolehandler = logging.StreamHandler()
+log_consolehandler.setFormatter(log_formatter)
+log_consolehandler.setLevel(logging.DEBUG)
+
+log = logging.getLogger(__name__)
+log.addHandler(log_filehandler)
+log.addHandler(log_consolehandler)
+log.setLevel(logging.DEBUG)
+
+utils_log = logging.getLogger('raspberrypi_utils.input_devices')
+utils_log.setLevel(logging.DEBUG)
+utils_log.addHandler(log_consolehandler)
 
 
 @add_state_features(Timeout)
@@ -28,6 +43,7 @@ class LaundryAlarm(ReadConfigMixin, TimeoutMachine):
             {'name': 'starting', 'timeout': 60, 'on_timeout': 'steady_on'},
             'on',
             {'name': 'stopping', 'timeout': 60, 'on_timeout': 'steady_off'},
+            'invalid',
         ]
         transitions = [
             # OFF
@@ -65,6 +81,17 @@ class LaundryAlarm(ReadConfigMixin, TimeoutMachine):
                 'dest': 'off',
                 'after': self.notification
             },
+            # INVALID
+            {
+                'trigger': 'error',
+                'source': '*',
+                'dest': 'invalid',
+            },
+            {
+                'trigger': 'error_resolved',
+                'source': 'invalid',
+                'dest': 'off',
+            },
         ]
 
         super(LaundryAlarm, self).__init__(
@@ -77,16 +104,37 @@ class LaundryAlarm(ReadConfigMixin, TimeoutMachine):
         self.config = self.read_config()
         GPIO.setmode(GPIO.BCM)
         self.led = LED(self.config['Main']['LED_PIN'])
-        self.threshold = 1
-        self.sensor = VibrationSensor(threshold_per_minute=self.threshold)
+        self.threshold = 0.25
+        self.sensor = VibrationSensor(sensitivity=(0.1, 0.1, 0.1), threshold_per_minute=self.threshold)
+        self.led.flash(on_seconds=0.25, off_seconds=5)  # because enter_off is not triggered upon startup
+        log.info('Initialized')
 
     def check(self):
-        rate = self.sensor.read()
-        if rate > self.threshold:
-            self.motion_detected()
+        if not self.check_connectivity():
+            self.error()
+        elif self.state == 'invalid':
+            log.info('Internet connectivity restored.')
+            self.error_resolved()
         else:
-            self.no_motion_detected()
+            rate = self.sensor.read()
+            log.debug('Rate = {}'.format(rate))
+            if rate > self.threshold:
+                self.motion_detected()
+            else:
+                self.no_motion_detected()
         sleep(self.config['Main']['SLEEP_SECONDS'])
+
+    @staticmethod
+    def check_connectivity():
+        try:
+            requests.head('http://www.google.com')
+            return True
+        except requests.ConnectionError:
+            log.error('No internet connectivity!')
+            return False
+
+    def on_enter_invalid(self):
+        self.led.off()
 
     def on_enter_starting(self):
         self.led.flash(on_seconds=1, off_seconds=1)
@@ -99,7 +147,7 @@ class LaundryAlarm(ReadConfigMixin, TimeoutMachine):
 
     def on_enter_off(self):
         self.sensor.reset()
-        self.led.off()
+        self.led.flash(on_seconds=0.25, off_seconds=5)
 
     def notification(self):
         send_gmail(
@@ -109,6 +157,7 @@ class LaundryAlarm(ReadConfigMixin, TimeoutMachine):
             'Laundry is done',
             'Your laundry is done at {}, get it while it\'s fluffy!'.format(now(tz='US/Eastern').format('h:mma'))
         )
+        log.info('Notification sent')
 
     def cleanup(self):
         self.sensor.reset()
