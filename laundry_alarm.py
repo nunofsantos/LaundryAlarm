@@ -30,6 +30,10 @@ utils_log = logging.getLogger('raspberrypi_utils.input_devices')
 utils_log.setLevel(logging.DEBUG)
 utils_log.addHandler(log_consolehandler)
 
+transitions_log = logging.getLogger('transitions')
+transitions_log.setLevel(logging.INFO)
+transitions_log.addHandler(log_consolehandler)
+
 
 @add_state_features(Timeout)
 class TimeoutMachine(Machine):
@@ -104,9 +108,12 @@ class LaundryAlarm(ReadConfigMixin, TimeoutMachine):
         self.config = self.read_config()
         GPIO.setmode(GPIO.BCM)
         self.led = LED(self.config['Main']['LED_PIN'])
-        self.threshold = 0.25
-        self.sensor = VibrationSensor(sensitivity=(0.1, 0.1, 0.1), threshold_per_minute=self.threshold)
+        self.threshold = 0.4
+        self.sensor = VibrationSensor(auto_sensitivity=1.25, threshold_per_minute=self.threshold)
         self.led.flash(on_seconds=0.25, off_seconds=5)  # because enter_off is not triggered upon startup
+        self.last_check_connectivity_frequency_seconds = 600
+        self.last_check_connectivity_at = None
+        self.last_check_connectivity_result = True
         log.info('Initialized')
 
     def check(self):
@@ -124,14 +131,18 @@ class LaundryAlarm(ReadConfigMixin, TimeoutMachine):
                 self.no_motion_detected()
         sleep(self.config['Main']['SLEEP_SECONDS'])
 
-    @staticmethod
-    def check_connectivity():
-        try:
-            requests.head('http://www.google.com')
-            return True
-        except requests.ConnectionError:
-            log.error('No internet connectivity!')
-            return False
+    def check_connectivity(self):
+        if not self.last_check_connectivity_at \
+           or (now() - self.last_check_connectivity_at).seconds > self.last_check_connectivity_frequency_seconds:
+            self.last_check_connectivity_at = now()
+            try:
+                requests.head('http://www.google.com')
+                log.debug('Internet connectivity OK')
+                self.last_check_connectivity_result = True
+            except requests.ConnectionError:
+                log.error('No internet connectivity!')
+                self.last_check_connectivity_result = False
+        return self.last_check_connectivity_result
 
     def on_enter_invalid(self):
         self.led.off()
@@ -140,6 +151,7 @@ class LaundryAlarm(ReadConfigMixin, TimeoutMachine):
         self.led.flash(on_seconds=1, off_seconds=1)
 
     def on_enter_on(self):
+        log.info('Laundry started')
         self.led.on()
 
     def on_enter_stopping(self):
@@ -147,6 +159,7 @@ class LaundryAlarm(ReadConfigMixin, TimeoutMachine):
 
     def on_enter_off(self):
         self.sensor.reset()
+        log.info('Laundry done')
         self.led.flash(on_seconds=0.25, off_seconds=5)
 
     def notification(self):
@@ -157,7 +170,7 @@ class LaundryAlarm(ReadConfigMixin, TimeoutMachine):
             'Laundry is done',
             'Your laundry is done at {}, get it while it\'s fluffy!'.format(now(tz='US/Eastern').format('h:mma'))
         )
-        log.info('Notification sent')
+        log.debug('Notification sent')
 
     def cleanup(self):
         self.sensor.reset()
